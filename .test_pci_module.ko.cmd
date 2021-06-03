@@ -1,0 +1,1 @@
+cmd_/home/linaro/pci_test/test_pci_module.ko := ld -r  -EL  -maarch64elf  --build-id  -T ./scripts/module-common.lds -T ./arch/arm64/kernel/module.lds -o /home/linaro/pci_test/test_pci_module.ko /home/linaro/pci_test/test_pci_module.o /home/linaro/pci_test/test_pci_module.mod.o;  true
