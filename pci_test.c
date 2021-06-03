@@ -1,5 +1,5 @@
 /***************************************************************************
- *   Copyright (C) 2005 by trem                                            *
+ *   Copyright (C) 2005 by tre                                           *
  *   tremyfr@yahoo.fr                                                      *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
@@ -9,7 +9,7 @@
  *                                                                         *
  *   This program is distributed in the hope that it will be useful,       *
  *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   MERCHANTABILITY or FITNES/.S FOR A PARTICULAR PURPOSE.  See the         *
  *   GNU General Public License for more details.                          *
  *                                                                         *
  *   You should have received a copy of the GNU General Public License     *
@@ -169,7 +169,7 @@ static int pci_cdev_search_minor(struct pci_cdev pci_cdev[],
 
 	return minor;
 }
-
+/* Release the PCI resources */
 void release_device(struct pci_dev *pdev)
 {
 
@@ -219,10 +219,8 @@ static ssize_t pci_read(struct file *file,	/* see include/linux/fs.h   */
 	while (byte_read < length) {
 		/* read a byte from the input */
 		value = inb(pci_io_addr + 1);
-
 		/* write the value in the user buffer */
-		put_user(value, &buffer[byte_read]);
-
+		put_user(value, &buffer[byte_read])
 		byte_read++;
 	}
 
@@ -239,8 +237,7 @@ static ssize_t pci_write(struct file *filp, const char *buffer, size_t len, loff
 	unsigned char value;
 	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
         struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
-
-          
+      
 	if (!drv_priv) {
 	    printk(KERN_INFO "no private data \n");
             return -1; 
@@ -282,7 +279,7 @@ int set_interrupts(struct pci_dev *pdev)
 {
     int irq;
 
-    /* We want MSI interrupt, 3 lines (just an example) */
+    /* We want to obtain MSI interrupts we are requesting 3 intrrupts and will fail if we are not successful */
     int ret = pci_alloc_irq_vectors(pdev, 3, 3, PCI_IRQ_MSI);
 
     if (ret < 0) {
@@ -317,17 +314,22 @@ static struct file_operations pci_ops = {
 	.read 		= pci_read,
 	.write 		= pci_write,
 	.open 		= pci_open,
-	.release 	= pci_release
-	
-
+	.release 	= pci_release,
+	.unlocked_ioctl = pci_ioctl
 };
+/*  This is the driver IOCTL.  This is the QBIT specific API to user space
+ *  it provides user space access to DMA to/from the QBIT PCI device, and to 
+ *  status the board
+ *
+ */
 
 
-/**
+
+/*
  * This function is called when a new pci device is associated with a driver
  *
- * return: 0 => this driver don't handle this device
- *         1 => this driver handle this device
+ * return: 1 => driver install failed
+ *         0 => driver install was successful
  *
  */
 static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
