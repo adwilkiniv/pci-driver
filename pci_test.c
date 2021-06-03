@@ -304,6 +304,55 @@ int set_interrupts(struct pci_dev *pdev)
 
 
 }
+void qbit_DMA(struct pci_dev *pdev, int* vaddr_bus )
+{
+   	dma_addr_t bus_addr;
+   	int* vaddr;
+   	size_t size = 16;
+	//struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
+	
+    vaddr = pci_alloc_consistent(pdev, size, &bus_addr);
+    printk(KERN_INFO "vaddr = 0x%X bus_addr = 0x%X \n", vaddr, bus_addr);
+    if(vaddr != NULL)
+    {
+    	    *vaddr = 0xb0bb00b;
+    	    *(vaddr +1) = 0xdeafb0b;
+    	    *(vaddr +2) = 0xdeadb0b;
+    }
+    printk(KERN_INFO "vaddr = 0x%X bus_addr = 0x%X \n", vaddr, bus_addr);
+    write_config(pdev, 0xA3C, bus_addr);
+    write_config(pdev, 0xA40, 0x87B00040);
+    vaddr_bus = vaddr;
+
+}
+
+static long pci_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
+        struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
+	int* vaddr = NULL; //address to coherent buffer
+	
+	switch(cmd)
+	{
+		case qbitDMA:
+			qbit_DMA(pdev, vaddr);
+			printk(KERN_INFO "vaddr is 0x%x \n", vaddr);
+			
+			if(copy_to_user((int*)arg, vaddr, sizeof(int*)))
+			   {
+				   return _EACCES;
+			   }
+			   break;	   
+			   
+		default:
+			return -EINVAL;
+			
+        }
+	
+	return 0;
+}
+			
+
 /**
  * This structure holds informations about the pci node
  *
@@ -419,30 +468,9 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     printk(KERN_INFO "mmio bar 0 start 0x%X mmio le bar 0 0x%X \n", mmio_start, mmio_len);
 
-    /* Allocate memory for the driver private data */
-   /* 
-    * drv_priv = kzalloc(sizeof(struct my_driver_priv), GFP_KERNEL);
-
-    if (!drv_priv) {
-        release_device(dev);
-        return -ENOMEM;
-    }
-    */
-
     /* Remap BAR to the local pointer */
     drv_priv->regmem = ioremap(mmio_start, mmio_len);
-     printk(KERN_INFO " regmem 0x%x \n", drv_priv->regmem);
-	     
-	     
-	     
-	     
-	     
-	     
-	     
-	     
-	  
-
-
+    printk(KERN_INFO " regmem 0x%x \n", drv_priv->regmem);
     if (!drv_priv->regmem) {
        release_device(dev);
        return -EIO;
