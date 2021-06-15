@@ -65,7 +65,8 @@ static int major;
 
 /**
  *  This structure is used to link a pci_dev to a cdev 
- *
+ *  This allows you to create a simple character device
+ *  while still having access to the PCI device support
  */
 struct pci_cdev {
 	int minor;
@@ -78,8 +79,10 @@ struct pci_cdev {
 struct my_driver_priv {
     u8 __iomem *hwmem;
     u8 __iomem *regmem;
-    unsigned long* buffer_vaddr;
-    dma_addr_t bus_addr;
+    void* buffer_vaddr;  /*kernels virtual address of shared DMA buffer*/
+    dma_addr_t bus_addr; /* this is the bus address of the DMA buffer */
+    //int bus_addr;
+    int size;
 };
 
 static struct pci_cdev pci_cdev[MAX_DEVICE];
@@ -209,24 +212,26 @@ static int pci_release(struct inode *inode, struct file *file)
  * This function is called when the device node is read
  *
  */
-static ssize_t pci_read(struct file *file,	/* see include/linux/fs.h   */
+static ssize_t pci_read(struct file *filp,	/* see include/linux/fs.h   */
 			   char *buffer,	/* buffer to fill with data */
 			   size_t length,	/* length of the buffer     */
 			   loff_t * offset)
 {
 	int byte_read = 0;
+	int i;
 	unsigned char value;
-	struct pci_dev *pdev = (struct pci_dev *)file->private_data;
-	unsigned long pci_io_addr = 0;
+	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
+        struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
+	
+	for(i=0; i<length; i++) {
+		/* read value on the buffer */
+		value = (unsigned char)buffer[i];
 
-	pci_io_addr = pci_resource_start(pdev,2);
-
-	while (byte_read < length) {
-		/* read a byte from the input */
-		value = inb(pci_io_addr + 1);
-		/* write the value in the user buffer */
+		/* read from the device */
+		value = ioread32(drv_priv->hwmem + *offset+(i*4));
 		put_user(value, &buffer[byte_read]);
-		byte_read++;
+               //
+	       //printk(KERN_INFO " data 0x%X offset 0x%X \n", value, off);
 	}
 
 	return byte_read;
@@ -234,8 +239,6 @@ static ssize_t pci_read(struct file *file,	/* see include/linux/fs.h   */
 /* Write some data to the device */
 void write_config(struct pci_dev *pdev, int offset, int data)
 {
-    //int data_to_write = 0xDEADBEEF; /* Just a random trash */
-
     struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
 
     if (!drv_priv) {
@@ -271,8 +274,8 @@ static ssize_t pci_write(struct file *filp, const char *buffer, size_t len, loff
 		value = (unsigned char)buffer[i];
 
 		/* write data to the device */
-		iowrite32(value, drv_priv->hwmem +(i*4));//+ (int)off);//pci_io_addr+i);
-		value = ioread32(drv_priv->hwmem +(i*4));//+ (int)off);
+		iowrite32(value, drv_priv->hwmem +(i*4));
+		value = ioread32(drv_priv->hwmem +(i*4));
                //
 	       //printk(KERN_INFO " data 0x%X offset 0x%X \n", value, off);
 	}
@@ -287,7 +290,11 @@ static ssize_t pci_write(struct file *filp, const char *buffer, size_t len, loff
 static irqreturn_t irq_handler_1(int irq, void *cookie)
 {
    (void) cookie;
+  // struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
+   //struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
+	
    printk("RDMA interrupt Handle IRQ #%d\n", irq);
+  // pci_free_consistent(pdev, drv_priv->size, drv_priv->buffer_vaddr, drv_priv->bus_addr);
    return IRQ_HANDLED;
 }
 
@@ -312,7 +319,7 @@ int set_interrupts(struct pci_dev *pdev)
         return ret;
     }
 
-    irq = pci_irq_vector(pdev,1 );//'2 correspoinds to the interrupt vector
+    irq = pci_irq_vector(pdev,1 );//'1 corresponds to the interrupt vector 
 
     /* Request IRQ # */
     request_irq(irq, irq_handler_1,0, "TEST IRQ", pdev);
@@ -320,14 +327,14 @@ int set_interrupts(struct pci_dev *pdev)
     printk(KERN_INFO "MSI 1 irq %d \n", irq);
 
     irq = pci_irq_vector(pdev, 2);
-    //'2 correspoinds to the interrupt vector in the QBIT XXX_VEC1
+    //'2 corresponds to the interrupt vector in the QBIT XXX_VEC1
     // where XXX is RDMA WDMA completed Mailbox etc. they must match
 
     printk(KERN_INFO "MSI 2 irq %d \n", irq);
 
 
     /* Request IRQ # */
-    return request_irq(irq, irq_handler_2,0, "TEST IRQ", pdev);
+    return request_irq(irq, irq_handler_2, 0, "TEST IRQ", pdev);
 
 
 }
@@ -340,28 +347,16 @@ void qbit_DMA(struct pci_dev *pdev, unsigned long* vaddr_bus )
 	struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
 
 	
-    vaddr = pci_alloc_consistent(pdev, size, &bus_addr);
+   // vaddr = pci_alloc_consistent(pdev, size, &bus_addr);
     vaddr = (int*) drv_priv->buffer_vaddr;
     bus_addr = drv_priv->bus_addr;
-    printk(KERN_INFO "vaddr = 0x%X bus_addr = 0x%X \n", vaddr, bus_addr);
-   
-    if(0)//(vaddr != NULL)
-    {
-    	    for(i = 0; i < 0x100; i+=3)
-	    {*(vaddr+i) = 0xb0bb00b;
-    	    *(vaddr +1+i) = 0xdeafb0b;
-    	    *(vaddr +2+i) = 0xdeadb0b;
-	    }
-    }
-    printk("MMAP buffer virt add %lx and value %lx\n", drv_priv->buffer_vaddr, *(drv_priv->buffer_vaddr));
+
     printk(KERN_INFO "vaddr = 0x%X bus_addr = 0x%X \n", vaddr, bus_addr);
     write_config(pdev, 0xA3C, bus_addr);
     write_config(pdev, 0xA40, 0x87B00040);
     *vaddr_bus = (unsigned long)vaddr;
-    printk(KERN_INFO "after address write\n");
- // printk(KERN_INFO "*probe bufffeervaddr_bus = 0x%X vaddr_bus = 0x%X \n", drv_priv->buffer_vaddr,*(drv_priv->buffer_vaddr));
 
-}
+ }
 
 #define qbitDMA 0
 
@@ -370,23 +365,18 @@ long pci_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
         struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
 	unsigned long* vaddr; //address to coherent buffer
-	unsigned long *len = 0xabcd;
 	unsigned long remaining;
 	
 	printk(KERN_INFO " IOCTLL\n");
-//	return 0;
 	switch(cmd)
 	{
 		case qbitDMA:
 			qbit_DMA(pdev, (unsigned long*)&vaddr);
 			printk(KERN_INFO "&vaddr is 0x%x vaddr is 0x%x\n", &vaddr,vaddr);
 
-
-		
-		//	if(copy_to_user(&arg, &vaddr, sizeof(unsigned long)))
-			 remaining = (copy_to_user((unsigned long*)arg, (unsigned long*)&vaddr/*&len*/, sizeof(unsigned long)));
-
-			   {
+			 
+			remaining = (copy_to_user((unsigned long*)arg, (unsigned long*)&vaddr, sizeof(unsigned long)));
+			 {
 				  // return -EACCES;
 				
 				   printk(KERN_INFO "remaining is 0x%x \n", remaining);
@@ -423,19 +413,41 @@ static struct vm_operations_struct pci_vm_ops = {
 
 static int pci_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	int ret = 0;
-	long unsigned int size = vma->vm_end - vma->vm_start;
-	phys_addr_t phys_addr;
-	printk(KERN_INFO "MMAP1\n");
+	
 	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
  	struct device *cdev = (struct device *)filp->private_data;
-
-	printk(KERN_INFO "MMAP 2 \n");
-
 	struct my_driver_priv *drv_priv = pci_get_drvdata(pdev);
+	int ret = 0;
+	long unsigned int size = vma->vm_end - vma->vm_start;
+	//phys_addr_t phys_addr;
+	//unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+	//unsigned long pfn_start = (virt_to_phys(drv_priv->buffer_vaddr) >> PAGE_SHIFT) + 
+	//	vma->vm_pgoff;
+	//printk("MMAP buffer virt add %lx and value %lx\n", drv_priv->buffer_vaddr, *(drv_priv->buffer_vaddr));
+	unsigned long virt_start = (unsigned long)drv_priv->buffer_vaddr;
 
-	printk(KERN_INFO "virt 0x%lx bus 0x%lx \n", drv_priv->buffer_vaddr, drv_priv->bus_addr);
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	ret = io_remap_pfn_range(vma, vma->vm_start, drv_priv->bus_addr >> PAGE_SHIFT, size, vma->vm_page_prot);
+	if(ret)
+		
+	{
 
+		printk("%s rempa_pfn_range failed at [%lx %lx] \n", __func__, vma->vm_start, vma->vm_end);
+	}
+	else
+	{
+ 		printk("%s rempa_pfn_range map at at [map %lx to  %lx] size %lx \n", __func__, virt_start, vma->vm_start,size);
+        }
+
+	size = __pa(drv_priv->buffer_vaddr);
+        printk(KERN_INFO "physical address 0x%x \n", size);
+        vma->vm_flags |= VM_LOCKED;
+        vma->vm_ops = &pci_vm_ops;
+        vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
+
+        pci_vm_open(vma);
+
+return ret;
 /*	unsigned long* kbuff = NULL;
 
 	kbuff = kzalloc(0x1000, GFP_KERNEL);
@@ -449,85 +461,6 @@ static int pci_mmap(struct file *filp, struct vm_area_struct *vma)
 *kbuff = 0xbeefb0b;
 
 		*/
-
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-
-	unsigned long pfn_start = (virt_to_phys(drv_priv->buffer_vaddr) >> PAGE_SHIFT) + 
-		vma->vm_pgoff;
-	printk("MMAP buffer virt add %lx and value %lx\n", drv_priv->buffer_vaddr, *(drv_priv->buffer_vaddr));
-	unsigned long virt_start = (unsigned long)drv_priv->buffer_vaddr + offset;
-
-	phys_addr = ((dma_to_phys(cdev, drv_priv->bus_addr)));
-
-	printk("phys_addr 1 0x%lx \n", phys_addr);
-
-	phys_addr = phys_addr & 0x00000000FFFFFFFF;
-
-	  printk("phys_addr 2 0x%lx \n", phys_addr);
-	  phys_addr = phys_addr >> PAGE_SHIFT;
-
-	    printk("phys_addr 3 0x%lx \n", phys_addr);
-
-
-
-
-
-	phys_addr = ((dma_to_phys(cdev, drv_priv->bus_addr)) & 0xFFFFFFFF) >> PAGE_SHIFT;
-	phys_addr = ((dma_to_phys(cdev, drv_priv->bus_addr)) ) >> PAGE_SHIFT;
-
-	  printk("phys_bus_addr 4 0x%lx \n", drv_priv->bus_addr >> PAGE_SHIFT);
-
-	printk("pfn_start 0x%lx phys 0x%lx offset 0x%lx size 0x%lx \n", pfn_start, phys_addr, offset, size);
-
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-//	pfn_start = ((int)drv_priv->bus_addr + offset) >> PAGE_SHIFT;
-
-	  printk("pfn_start 0x%lx phys 0x%lx offset 0x%lx size 0x%lx \n", pfn_start, pfn_start << PAGE_SHIFT, offset, size);
- 
-	ret = io_remap_pfn_range(vma, vma->vm_start, drv_priv->bus_addr >> PAGE_SHIFT, /*pfn_start*/ size, vma->vm_page_prot);
-	if(ret)
-		
-	{
-
-		printk("%s rempa_pfn_range failed at [%lx %lx] \n", __func__, vma->vm_start, vma->vm_end);
-	}
-	else
-	{
- 		printk("%s rempa_pfn_range map at at [map %lx to  %lx] size %lx \n", __func__, virt_start, vma->vm_start,size);
-        }
-	     size = __pa(drv_priv->buffer_vaddr);
-        printk(KERN_INFO "physical address 0x%x \n", size);
-        vma->vm_flags |= VM_LOCKED;
-//	vma->vm_flags |= VM_RESERVED;
-        vma->vm_ops = &pci_vm_ops;
-        vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
-
-        pci_vm_open(vma);
-
-return ret;
-
-
-
-
-
-//size = __pa(drv_priv->buffer_vaddr);
-        printk(KERN_INFO "drv_priv->vaddr address 0x%x \n", drv_priv->buffer_vaddr);
-size = __pa(drv_priv->buffer_vaddr);
-        printk(KERN_INFO "physical address 0x%x \n", size);
-
-
-	if(remap_pfn_range(vma, vma->vm_start, __pa(drv_priv->buffer_vaddr) >> PAGE_SHIFT ,
-				size, vma->vm_page_prot) < 0)
-		return -EAGAIN;
-	size = __pa(drv_priv->buffer_vaddr);
-	printk(KERN_INFO "physical address 0x%x \n", size);
-	vma->vm_flags |= VM_LOCKED;
-	vma->vm_ops = &pci_vm_ops;
-	vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
-
-	pci_vm_open(vma);
-
-	return 0;
 }
 
 
@@ -570,19 +503,11 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	unsigned long mmio_start, mmio_len;
 	struct my_driver_priv *drv_priv;
 
-	 dma_addr_t bus_addr;
+	dma_addr_t bus_addr;
         unsigned long* vaddr;
-        size_t size = 16;
-        //struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
-
-    vaddr = pci_alloc_consistent(dev, size, &bus_addr);
-
-    *vaddr = 0xdeadb0b;
-
-
-
-
-	/* add this pci device in pci_cdev */
+        size_t size = 0x1000;
+	
+  	/* add this pci device in pci_cdev */
 	if ((minor = pci_cdev_add(pci_cdev, MAX_DEVICE, dev)) < 0)
 		goto error;
 
@@ -632,11 +557,7 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		goto error;
 	}
 
-    /* Get start and stop memory offsets for BAR2 set to hwmem2*/
-    mmio_start = pci_resource_start(dev, 2);
-    mmio_len = pci_resource_len(dev, 2);
 
-    printk(KERN_INFO "mmio bar 2 start 0x%X mmio len bar 2 0x%X \n", mmio_start, mmio_len);
 
     /* Allocate memory for the driver private data */
     drv_priv = kzalloc(sizeof(struct my_driver_priv), GFP_KERNEL);
@@ -645,14 +566,23 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
         release_device(dev);
         return -ENOMEM;
     }
-
-    /* gt the driver buffer virtual addr */
-
+    
+/*get a singel buffer just for test now will have to get some kind of linked list*/
+    vaddr = pci_alloc_consistent(dev, size, &bus_addr);
+    *vaddr = 0xdeadb0b;
+    /* get the driver buffer virtual addr */
     drv_priv->buffer_vaddr = vaddr;
     /*get the PCI bus addr ... source address for the Qbit PCI dievice*/
     drv_priv->bus_addr = bus_addr;
+    /*size of allocated buffer*/
+    drv_priv->size = size;
     printk("probe function dma buffer %lx bus_addr %lx \n", drv_priv->buffer_vaddr, drv_priv->bus_addr);
+    
+    /* Get start and stop memory offsets for BAR2 set to hwmem2*/
+    mmio_start = pci_resource_start(dev, 2);
+    mmio_len = pci_resource_len(dev, 2);
 
+    printk(KERN_INFO "mmio bar 2 start 0x%X mmio len bar 2 0x%X \n", mmio_start, mmio_len);
     /* Remap BAR to the local pointer */
     drv_priv->hwmem = ioremap(mmio_start, mmio_len);
     printk(KERN_INFO " hwmem 0x%x \n", drv_priv->hwmem);
@@ -683,12 +613,10 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
    pci_set_master(dev);
    pci_set_dma_mask(dev, DMA_BIT_MASK(64));
 
-   qbit_DMA(dev, &data );
-printk("after DMA \n");
+//   qbit_DMA(dev, &data );
+//printk("after DMA \n");
 
    return set_interrupts(dev);
-
-//	return 0;
 
 error:
 	return 1;
@@ -718,10 +646,11 @@ static void pci_remove(struct pci_dev *dev)
 	if (drv_priv) {
         printk(KERN_INFO "remove private data \n");
 		if (drv_priv->hwmem) {
-            
-			iounmap(drv_priv->hwmem);
-        
-		}
+            		iounmap(drv_priv->hwmem);
+        	}
+		if (drv_priv->regmem) {
+            		iounmap(drv_priv->regmem);
+        	}
 	kfree(drv_priv);
 	}
 	/* free the irqs*/
@@ -731,6 +660,8 @@ static void pci_remove(struct pci_dev *dev)
         free_irq(irq, dev);
 
         pci_free_irq_vectors(dev);
+	
+	//pci_free_consistent(dev, size, cpu_addr, dma_handle);
 
         
 
