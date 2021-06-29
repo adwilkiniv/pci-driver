@@ -22,7 +22,7 @@
  * 
  * This is a driver which can R/W and DMA to/from the QBIT device.
  *
-  * 
+ * 
  */
 
 #include <linux/kernel.h>
@@ -34,7 +34,8 @@
 #include <linux/uaccess.h>        /* for put_user */
 #include <linux/ioctl.h>
 #include <linux/mman.h>
-#include <linux/dma-direct.h>
+#include <linux/poll.h>
+//#include <linux/dma-direct.h>
 //#include <arch/arm/include/asm/dma-direct.h>
 
 #define MAX_DEVICE		8
@@ -45,6 +46,9 @@
 MODULE_DESCRIPTION("QBIT PCI driver");
 MODULE_AUTHOR("Alfred (alfredw@qti.qualcomm.com)");
 MODULE_LICENSE("GPL");
+
+//test commit
+
 
 /**
  * This table holds the list of (VendorID,DeviceID) supported by this driver
@@ -72,18 +76,53 @@ struct pci_cdev {
 	int minor;
 	struct pci_dev *pci_dev;
 	struct cdev *cdev;
+
 };
+struct q_doneinfo {
+	unsigned msg;			/* return message/value      	       */
+	unsigned detail;		/* detail for message      		 */
+	//unsigned long long endtime;	/* finish time absolute in HRT microseconds */
+	//unsigned long long cycles;	/* cycle count where appropriate   	 */
+};
+
+
+#define GETDONE		0x9D00
+#define MSG_DONE	0xff000000
+#define MSG_MSG	        0x01000000
+#define MSG_ABORT	0x10000000
+#define WAITDONE	0x9D01
+#define MAX_BUF    	5
+
+#if(0)
+struct ring_buffer {
+    void* buffer_vaddr[MAX_BUF];  /*kernels virtual address of shared DMA buffer*/
+    dma_addr_t bus_addr[MAX_BUF]; /* this is the bus address of the DMA buffer */
+    int size[MAX_BUF];
+  
+};
+#endif
+	
 
 /* This is a "private" data structure */
 /* You can store there any data that should be passed between driver's functions */
 struct my_driver_priv {
     u8 __iomem *hwmem;
     u8 __iomem *regmem;
-    void* buffer_vaddr;  /*kernels virtual address of shared DMA buffer*/
-    dma_addr_t bus_addr; /* this is the bus address of the DMA buffer */
-    //int bus_addr;
-    int size;
+   // struct ring_buf ring_buf;
+    wait_queue_head_t mbq;
+    spinlock_t lock;
+	
+    void* buffer_vaddr[MAX_BUF];  /*kernels virtual address of shared DMA buffer*/
+    dma_addr_t bus_addr[MAX_BUF]; /* this is the bus address of the DMA buffer */
+    int size[MAX_BUF];
+    int di_head;
+    int di_tail;
+    struct q_doneinfo doneinfo[MAX_BUF];
+	
+    
 };
+
+
 
 static struct pci_cdev pci_cdev[MAX_DEVICE];
 
@@ -248,9 +287,9 @@ void write_config(struct pci_dev *pdev, int offset, int data)
     /* Write 32-bit data to the device memory */
     iowrite32(data, drv_priv->regmem + offset);
     data = ioread32(drv_priv->regmem + offset);
-    printk(KERN_INFO " regmem 0x%x \n", drv_priv->regmem);
+    // printk(" regmem 0x%c \n", drv_priv->regmem);
 
-    printk(KERN_INFO " data 0x%X offset 0x%X \n", data, offset);
+    printk( " data 0x%X offset 0x%X \n", data, offset);
 }
 
 /**
@@ -265,7 +304,7 @@ static ssize_t pci_write(struct file *filp, const char *buffer, size_t len, loff
         struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
       
 	if (!drv_priv) {
-	    printk(KERN_INFO "no private data \n");
+	    printk( "no private data \n");
             return -1; 
       	}
 
@@ -280,7 +319,7 @@ static ssize_t pci_write(struct file *filp, const char *buffer, size_t len, loff
 	       //printk(KERN_INFO " data 0x%X offset 0x%X \n", value, off);
 	}
 
-	printk(KERN_INFO "write return %d \n", len);
+	//	printk( "write return %d \n", len);
 
 	return len;
 }
@@ -289,10 +328,32 @@ static ssize_t pci_write(struct file *filp, const char *buffer, size_t len, loff
 /* */
 static irqreturn_t irq_handler_1(int irq, void *cookie)
 {
-   (void) cookie;
-  // struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
-   //struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
+   
+        struct pci_dev *pdev = (struct pci_dev *)cookie;
+  	struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
+  	unsigned long flags;
+	int bus_addr;
 	
+/* Get the buffer/bus source address for the chained DMA */
+        bus_addr = drv_priv->bus_addr[drv_priv->di_tail];
+	
+	spin_lock_irqsave(&drv_priv->lock, flags);
+	drv_priv->di_tail++;
+	if (drv_priv->di_tail != drv_priv->di_head)
+	{
+		write_config(pdev, 0xA3C, bus_addr);
+    		write_config(pdev, 0xA40, 0x87B00040);
+		//	MSI_START;
+	}
+		
+	if (drv_priv->di_tail >= MAX_BUF)
+		drv_priv->di_tail = 0;
+	spin_unlock_irqrestore(&drv_priv->lock, flags);
+
+	/*printk("jbig int %d\n", jbig->ints++);*/
+
+	/* wakeup tasks waiting on dma done */
+	wake_up_interruptible(&drv_priv->mbq);
    printk("RDMA interrupt Handle IRQ #%d\n", irq);
   // pci_free_consistent(pdev, drv_priv->size, drv_priv->buffer_vaddr, drv_priv->bus_addr);
    return IRQ_HANDLED;
@@ -342,18 +403,30 @@ void qbit_DMA(struct pci_dev *pdev, unsigned long* vaddr_bus )
 {
    	dma_addr_t bus_addr;
    	int* vaddr;
-   	size_t size = 16;
-	int i;
+	//	size_t size = 16;
+	//	int i;
 	struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
 
-	
-   // vaddr = pci_alloc_consistent(pdev, size, &bus_addr);
     vaddr = (int*) drv_priv->buffer_vaddr;
-    bus_addr = drv_priv->bus_addr;
+    bus_addr = drv_priv->bus_addr[drv_priv->di_head];
+    printk("di head 0x%x drv_privbutsaddr 0x%x bus addr 0 0x%x\n", drv_priv->di_head, drv_priv->bus_addr[drv_priv->di_head], drv_priv->bus_addr[0]);
 
-    printk(KERN_INFO "vaddr = 0x%X bus_addr = 0x%X \n", vaddr, bus_addr);
-    write_config(pdev, 0xA3C, bus_addr);
-    write_config(pdev, 0xA40, 0x87B00040);
+    printk( "vaddr = 0x%X bus_addr = 0x%x \n", vaddr, bus_addr);
+
+    
+	/*USER initiated a DMA write to the device... if the buffer is empty... start the DMA*/
+	if (drv_priv->di_tail == drv_priv->di_head)
+	{
+		write_config(pdev, 0xA3C, bus_addr);
+    		write_config(pdev, 0xA40, 0x87B00040);
+		drv_priv->di_head++;
+		//	MSI START;
+	}
+	else{
+		drv_priv->di_head++;
+	}
+	/*NOTE: currently the returned virtual address of the buffer is being returned to USER space*/
+	/*      it has no purpose yet... just figured it might have a use.*/
     *vaddr_bus = (unsigned long)vaddr;
 
  }
@@ -363,23 +436,23 @@ void qbit_DMA(struct pci_dev *pdev, unsigned long* vaddr_bus )
 long pci_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
-        struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
+	//   struct my_driver_priv *drv_priv = (struct my_driver_priv *) pci_get_drvdata(pdev);
 	unsigned long* vaddr; //address to coherent buffer
 	unsigned long remaining;
 	
-	printk(KERN_INFO " IOCTLL\n");
+	printk( " IOCTLL\n");
 	switch(cmd)
 	{
 		case qbitDMA:
 			qbit_DMA(pdev, (unsigned long*)&vaddr);
-			printk(KERN_INFO "&vaddr is 0x%x vaddr is 0x%x\n", &vaddr,vaddr);
+			//	printk( "&vaddr is 0x%lu vaddr is 0x%lu \n", &vaddr,vaddr);
 
 			 
 			remaining = (copy_to_user((unsigned long*)arg, (unsigned long*)&vaddr, sizeof(unsigned long)));
 			 {
 				  // return -EACCES;
 				
-				   printk(KERN_INFO "remaining is 0x%x \n", remaining);
+				   printk( "remaining is 0x%lu \n", remaining);
 
 				  return remaining;
 			   }
@@ -410,24 +483,48 @@ static struct vm_operations_struct pci_vm_ops = {
 	.close = pci_vm_close
 };
 
-
+static int mmap_count = 0;
 static int pci_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	
 	struct pci_dev *pdev = (struct pci_dev *)filp->private_data;
- 	struct device *cdev = (struct device *)filp->private_data;
+	//	struct device *cdev = (struct device *)filp->private_data;
 	struct my_driver_priv *drv_priv = pci_get_drvdata(pdev);
 	int ret = 0;
+	int* vaddr;
+	unsigned long virt_start;
+	dma_addr_t bus_addr;
 	long unsigned int size = vma->vm_end - vma->vm_start;
+	
+	/*get a singel buffer just for test now will have to get some kind of linked list*/
+	vaddr = pci_alloc_consistent(pdev, size, &bus_addr);//&drv_priv->bus_addr[mmap_count]);//[drv_priv->mmap_count]);
+    
+    if(mmap_count > MAX_BUF)
+	{
+		return -ENOMEM;
+	}
+    *vaddr = 0xdeadb0b;
+    printk("bus addr 0x%x drv_priv bus add 0x%x \n",  bus_addr, drv_priv->bus_addr);
+    /* get the driver buffer virtual addr */
+    drv_priv->buffer_vaddr[mmap_count] = vaddr;
+    /*get the PCI bus addr ... source address for the Qbit PCI dievice*/
+    drv_priv->bus_addr[mmap_count] = bus_addr;
+    /*size of allocated buffer*/
+    drv_priv->size[mmap_count] = size;
+    printk("probe function dma buffer %lx bus_addr %lx \n", drv_priv->buffer_vaddr[mmap_count], drv_priv->bus_addr[mmap_count]);
+	
+	
+	
+	
 	//phys_addr_t phys_addr;
 	//unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
 	//unsigned long pfn_start = (virt_to_phys(drv_priv->buffer_vaddr) >> PAGE_SHIFT) + 
 	//	vma->vm_pgoff;
 	//printk("MMAP buffer virt add %lx and value %lx\n", drv_priv->buffer_vaddr, *(drv_priv->buffer_vaddr));
-	unsigned long virt_start = (unsigned long)drv_priv->buffer_vaddr;
+        virt_start = (unsigned long)drv_priv->buffer_vaddr[mmap_count];
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-	ret = io_remap_pfn_range(vma, vma->vm_start, drv_priv->bus_addr >> PAGE_SHIFT, size, vma->vm_page_prot);
+	ret = io_remap_pfn_range(vma, vma->vm_start, drv_priv->bus_addr[mmap_count] >> PAGE_SHIFT, size, vma->vm_page_prot);
 	if(ret)
 		
 	{
@@ -439,13 +536,14 @@ static int pci_mmap(struct file *filp, struct vm_area_struct *vma)
  		printk("%s rempa_pfn_range map at at [map %lx to  %lx] size %lx \n", __func__, virt_start, vma->vm_start,size);
         }
 
-	size = __pa(drv_priv->buffer_vaddr);
-        printk(KERN_INFO "physical address 0x%x \n", size);
+	size = __pa(drv_priv->buffer_vaddr[mmap_count]);
+        printk( "physical address 0x%lu \n", size);
         vma->vm_flags |= VM_LOCKED;
         vma->vm_ops = &pci_vm_ops;
         vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
 
         pci_vm_open(vma);
+	mmap_count++;
 
 return ret;
 /*	unsigned long* kbuff = NULL;
@@ -470,7 +568,30 @@ return ret;
  *
  */
 
+static unsigned int pci_poll(struct file *filp, poll_table *wait)
+{
+	struct pci_dev* pdev;
+	unsigned int mask = 0;
+	unsigned long flags;
+	struct my_driver_priv *drv_priv;
+	pdev = (struct pci_dev*)filp->private_data;
+	//	struct my_driver_priv *drv_priv;
+	 drv_priv = pci_get_drvdata(pdev);
 
+	poll_wait(filp, &drv_priv->mbq, wait);
+	//spin_lock_irqsave(&pdev->lock, flags);
+	spin_lock_irqsave(&drv_priv->lock, flags);
+	if (drv_priv->di_head != drv_priv->di_tail)
+		mask |= POLLIN | POLLRDNORM; /* readable */
+		
+	if (drv_priv->di_head != drv_priv->di_tail-1)//head caught up to tail
+	{
+	  if((drv_priv->di_head != MAX_BUF) |( drv_priv->di_tail != 0)) //special wrap around full case
+		mask |= POLLIN | POLLWRNORM; /* writeable */
+	}
+	spin_unlock_irqrestore(&drv_priv->lock, flags);
+	return mask;
+	}
 
 
 /**
@@ -484,6 +605,7 @@ static struct file_operations pci_ops = {
         .open           = pci_open,
         .release        = pci_release,
         .mmap           = pci_mmap,
+	.poll 		= pci_poll,
         .unlocked_ioctl = pci_ioctl
 };
 
@@ -497,15 +619,17 @@ static struct file_operations pci_ops = {
 static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	int ret,err, minor, bar;
-	unsigned long data;
+
 	struct cdev *cdev;
 	dev_t devno;
 	unsigned long mmio_start, mmio_len;
 	struct my_driver_priv *drv_priv;
 
-	dma_addr_t bus_addr;
-        unsigned long* vaddr;
-        size_t size = 0x1000;
+	//	dma_addr_t bus_addr;
+	// unsigned long* vaddr;
+        //size_t size = 0x1000;
+	
+	printk("PROBE \n");
 	
   	/* add this pci device in pci_cdev */
 	if ((minor = pci_cdev_add(pci_cdev, MAX_DEVICE, dev)) < 0)
@@ -567,25 +691,16 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
         return -ENOMEM;
     }
     
-/*get a singel buffer just for test now will have to get some kind of linked list*/
-    vaddr = pci_alloc_consistent(dev, size, &bus_addr);
-    *vaddr = 0xdeadb0b;
-    /* get the driver buffer virtual addr */
-    drv_priv->buffer_vaddr = vaddr;
-    /*get the PCI bus addr ... source address for the Qbit PCI dievice*/
-    drv_priv->bus_addr = bus_addr;
-    /*size of allocated buffer*/
-    drv_priv->size = size;
-    printk("probe function dma buffer %lx bus_addr %lx \n", drv_priv->buffer_vaddr, drv_priv->bus_addr);
+
     
     /* Get start and stop memory offsets for BAR2 set to hwmem2*/
     mmio_start = pci_resource_start(dev, 2);
     mmio_len = pci_resource_len(dev, 2);
 
-    printk(KERN_INFO "mmio bar 2 start 0x%X mmio len bar 2 0x%X \n", mmio_start, mmio_len);
+    printk("mmio bar 2 start 0x%x mmio len bar 2 0x%x \n", mmio_start, mmio_len);
     /* Remap BAR to the local pointer */
     drv_priv->hwmem = ioremap(mmio_start, mmio_len);
-    printk(KERN_INFO " hwmem 0x%x \n", drv_priv->hwmem);
+    // printk( " hwmem 0x%x \n", drv_priv->hwmem);
 
     if (!drv_priv->hwmem) {
        release_device(dev);
@@ -595,15 +710,21 @@ static int pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
     mmio_start = pci_resource_start(dev, 0);
     mmio_len = pci_resource_len(dev, 0);
 
-    printk(KERN_INFO "mmio bar 0 start 0x%X mmio le bar 0 0x%X \n", mmio_start, mmio_len);
+    printk("mmio bar 0 start 0x%x mmio le bar 0 0x%x \n", mmio_start, mmio_len);
 
     /* Remap BAR to the local pointer */
     drv_priv->regmem = ioremap(mmio_start, mmio_len);
-    printk(KERN_INFO " regmem 0x%x \n", drv_priv->regmem);
+    //  printk(" regmem 0x%x \n", drv_priv->regmem);
     if (!drv_priv->regmem) {
        release_device(dev);
        return -EIO;
     }
+
+    drv_priv->di_head = 0;
+    drv_priv->di_tail = 0;
+	
+    spin_lock_init(&drv_priv->lock);
+    init_waitqueue_head(&drv_priv->mbq);
  
     /* Set driver private data */
     /* Now we can access mapped "hwmem" from the any driver's function */
